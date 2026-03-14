@@ -178,9 +178,19 @@ src/
 
 Set a password on your Monarch account at [Settings > Security](https://app.monarchmoney.com/settings/security), then use that password with this library.
 
+## Testing
+
+```bash
+npm test              # run tests once
+npm run test:watch    # run tests in watch mode
+npm run test:coverage # run with coverage report
+```
+
+Tests use [Vitest](https://vitest.dev) and do not require real API credentials (fetch is mocked where needed).
+
 ## Contributing
 
-Contributions welcome. Please ensure TypeScript compiles cleanly (`npm run build`).
+Contributions welcome. Please ensure TypeScript compiles cleanly (`npm run build`) and tests pass (`npm test`).
 
 ## License
 
