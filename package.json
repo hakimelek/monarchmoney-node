@@ -1,16 +1,21 @@
 {
   "name": "@hakimelek/monarchmoney",
-  "version": "0.1.0",
-  "description": "Node.js/TypeScript API client for Monarch Money. Unofficial; not affiliated with Monarch Money.",
+  "version": "0.3.0",
+  "description": "Node.js/TypeScript API client for Monarch Money with built-in MCP server for AI agents. Unofficial; not affiliated with Monarch Money.",
   "type": "module",
-  "main": "dist/index.js",
+  "main": "dist/cjs/index.js",
+  "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
+      "require": "./dist/cjs/index.js",
       "default": "./dist/index.js"
     }
+  },
+  "bin": {
+    "monarchmoney-mcp": "dist/mcp.js"
   },
   "files": [
     "dist",
@@ -18,11 +23,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
     "clean": "rm -rf dist",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:connection": "node scripts/test-connection.js",
     "prepublishOnly": "npm run clean && npm run build"
   },
   "keywords": [
@@ -32,7 +38,11 @@
     "api",
     "finance",
     "budget",
-    "personal-finance"
+    "personal-finance",
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "agent"
   ],
   "author": "",
   "license": "MIT",
@@ -48,12 +58,15 @@
     "node": ">=18"
   },
   "dependencies": {
-    "speakeasy": "^2.0.0"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "speakeasy": "^2.0.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
     "@types/speakeasy": "^2.0.10",
     "@vitest/coverage-v8": "^2.0.0",
+    "dotenv": "^16.4.0",
     "typescript": "^5.3.0",
     "vitest": "^2.0.0"
   }

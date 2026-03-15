@@ -13,13 +13,37 @@ export class MonarchMoneyError extends Error {
 }
 
 /**
- * Thrown when multi-factor authentication is required to complete login.
- * Catch this error and call `multiFactorAuthenticate()` with the TOTP code.
+ * Thrown when multi-factor authentication (TOTP) is required to complete login.
+ * Catch this and call `multiFactorAuthenticate(email, password, totpCode)`.
  */
 export class RequireMFAException extends MonarchMoneyError {
   constructor(message = "Multi-Factor Auth Required") {
     super(message, "MFA_REQUIRED");
     this.name = "RequireMFAException";
+  }
+}
+
+/**
+ * Thrown when the API sends a one-time code to the user's email that must be
+ * submitted to continue login. Catch this and call
+ * `submitEmailOtp(email, password, code)` with the code from the email.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await mm.login(email, password);
+ * } catch (e) {
+ *   if (e instanceof EmailOtpRequiredException) {
+ *     const code = await promptUser("Enter the code from your email:");
+ *     await mm.submitEmailOtp(email, password, code);
+ *   }
+ * }
+ * ```
+ */
+export class EmailOtpRequiredException extends MonarchMoneyError {
+  constructor(message = "Email verification code required. Check your email.") {
+    super(message, "EMAIL_OTP_REQUIRED");
+    this.name = "EmailOtpRequiredException";
   }
 }
 

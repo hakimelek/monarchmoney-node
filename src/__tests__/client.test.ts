@@ -196,4 +196,325 @@ describe("MonarchMoney", () => {
       await expect(mm.getAccounts()).rejects.toThrow("Unauthorized");
     });
   });
+
+  describe("retry with backoff", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("retries on 500 and succeeds on subsequent attempt", async () => {
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 500,
+          statusText: "Internal Server Error",
+          headers: new Headers(),
+        } as unknown as Response)
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 500,
+          statusText: "Internal Server Error",
+          headers: new Headers(),
+        } as unknown as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({
+            data: { accounts: [], householdPreferences: { id: "p", accountGroupOrder: [] } },
+          }),
+        } as unknown as Response);
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 3, baseDelayMs: 1 },
+      });
+      const result = await mm.getAccounts();
+      expect(result.accounts).toEqual([]);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("gives up after maxRetries and returns the error response", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 502,
+        statusText: "Bad Gateway",
+        headers: new Headers(),
+      } as unknown as Response);
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 2, baseDelayMs: 1 },
+      });
+      await expect(mm.getAccounts()).rejects.toThrow(RequestFailedException);
+      expect(mockFetch).toHaveBeenCalledTimes(3); // 1 initial + 2 retries
+    });
+
+    it("does not retry on non-retryable status codes", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        headers: new Headers(),
+      } as unknown as Response);
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 3, baseDelayMs: 1 },
+      });
+      await expect(mm.getAccounts()).rejects.toThrow(RequestFailedException);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries disabled when maxRetries is 0", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        statusText: "Internal Server Error",
+        headers: new Headers(),
+      } as unknown as Response);
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 0 },
+      });
+      await expect(mm.getAccounts()).rejects.toThrow(RequestFailedException);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("rate limiter", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("completes requests with rate limiting enabled", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({
+          data: { accounts: [], householdPreferences: { id: "p", accountGroupOrder: [] } },
+        }),
+      } as unknown as Response);
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        rateLimit: { requestsPerSecond: 50 },
+        retry: { maxRetries: 0 },
+      });
+
+      await Promise.all([mm.getAccounts(), mm.getAccounts(), mm.getAccounts()]);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not throttle when rate limiting is disabled", async () => {
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({
+          data: { accounts: [], householdPreferences: { id: "p", accountGroupOrder: [] } },
+        }),
+      } as unknown as Response);
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 0 },
+      });
+
+      const start = Date.now();
+      await Promise.all([mm.getAccounts(), mm.getAccounts()]);
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("auto-pagination", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    function makeTxPage(ids: string[], totalCount: number) {
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          data: {
+            allTransactions: {
+              totalCount,
+              results: ids.map((id) => ({
+                id,
+                amount: 10,
+                pending: false,
+                date: "2025-01-01",
+                hideFromReports: false,
+                plaidName: null,
+                notes: null,
+                isRecurring: false,
+                reviewStatus: null,
+                needsReview: false,
+                isSplitTransaction: false,
+                category: null,
+                merchant: { id: "m1", name: "Store" },
+                account: { id: "a1", displayName: "Checking" },
+                tags: [],
+              })),
+            },
+            transactionRules: [],
+          },
+        }),
+      } as unknown as Response;
+    }
+
+    it("getAllTransactions fetches all pages", async () => {
+      const page1Ids = Array.from({ length: 100 }, (_, i) => `tx-${i}`);
+      const page2Ids = Array.from({ length: 100 }, (_, i) => `tx-${100 + i}`);
+      const page3Ids = Array.from({ length: 50 }, (_, i) => `tx-${200 + i}`);
+
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(makeTxPage(page1Ids, 250))
+        .mockResolvedValueOnce(makeTxPage(page2Ids, 250))
+        .mockResolvedValueOnce(makeTxPage(page3Ids, 250));
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 0 },
+      });
+      const all = await mm.getAllTransactions({
+        startDate: "2025-01-01",
+        endDate: "2025-12-31",
+        pageSize: 100,
+      });
+      expect(all).toHaveLength(250);
+      expect(all[0].id).toBe("tx-0");
+      expect(all[249].id).toBe("tx-249");
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it("getTransactionPages yields pages as async generator", async () => {
+      const mockFetch = vi.fn()
+        .mockResolvedValueOnce(makeTxPage(["a", "b"], 3))
+        .mockResolvedValueOnce(makeTxPage(["c"], 3));
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 0 },
+      });
+
+      const pages: string[][] = [];
+      for await (const page of mm.getTransactionPages({
+        startDate: "2025-01-01",
+        endDate: "2025-12-31",
+        pageSize: 2,
+      })) {
+        pages.push(page.map((tx) => tx.id));
+      }
+      expect(pages).toEqual([["a", "b"], ["c"]]);
+    });
+
+    it("returns empty array when no transactions exist", async () => {
+      const mockFetch = vi.fn().mockResolvedValueOnce(makeTxPage([], 0));
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 0 },
+      });
+      const all = await mm.getAllTransactions();
+      expect(all).toEqual([]);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("requestAccountsRefreshAndWait onProgress", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("calls onProgress with correct completed/total on each poll", async () => {
+      let callCount = 0;
+      const mockFetch = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          // getAccounts call
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({
+              data: {
+                accounts: [
+                  { id: "a1", displayName: "Checking" },
+                  { id: "a2", displayName: "Savings" },
+                ],
+                householdPreferences: { id: "p", accountGroupOrder: [] },
+              },
+            }),
+          } as unknown as Response);
+        }
+        if (callCount === 2) {
+          // requestAccountsRefresh (ForceRefreshMutation)
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({
+              data: { forceRefreshAccounts: { success: true, errors: [] } },
+            }),
+          } as unknown as Response);
+        }
+        if (callCount === 3) {
+          // first poll — a1 done, a2 still syncing
+          return Promise.resolve({
+            ok: true,
+            json: () => Promise.resolve({
+              data: {
+                accounts: [
+                  { id: "a1", hasSyncInProgress: false },
+                  { id: "a2", hasSyncInProgress: true },
+                ],
+              },
+            }),
+          } as unknown as Response);
+        }
+        // second poll — both done
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({
+            data: {
+              accounts: [
+                { id: "a1", hasSyncInProgress: false },
+                { id: "a2", hasSyncInProgress: false },
+              ],
+            },
+          }),
+        } as unknown as Response);
+      });
+
+      vi.stubGlobal("fetch", mockFetch);
+
+      const progressCalls: Array<{ completed: number; total: number }> = [];
+      const mm = new MonarchMoney({
+        token: "test-token",
+        retry: { maxRetries: 0 },
+      });
+      const result = await mm.requestAccountsRefreshAndWait({
+        delay: 0.01,
+        timeout: 5,
+        onProgress: (p) => progressCalls.push({ completed: p.completed, total: p.total }),
+      });
+
+      expect(result).toBe(true);
+      expect(progressCalls).toHaveLength(2);
+      expect(progressCalls[0]).toEqual({ completed: 1, total: 2 });
+      expect(progressCalls[1]).toEqual({ completed: 2, total: 2 });
+    });
+  });
 });

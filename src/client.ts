@@ -1,9 +1,15 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
 import speakeasy from "speakeasy";
 import { getLoginEndpoint, getGraphQL, getAccountBalanceHistoryUploadEndpoint } from "./endpoints.js";
-import { LoginFailedException, RequireMFAException, RequestFailedException } from "./errors.js";
+import {
+  LoginFailedException,
+  RequireMFAException,
+  EmailOtpRequiredException,
+  RequestFailedException,
+} from "./errors.js";
 import * as queries from "./queries.js";
 import type {
   GetAccountsResponse,
@@ -38,11 +44,55 @@ import type {
   SetTransactionTagsResponse,
   UpdateTransactionSplitResponse,
   SetBudgetAmountResponse,
+  Transaction,
 } from "./types.js";
 
 const SESSION_FILE = ".mm/mm_session.json";
 const DEFAULT_RECORD_LIMIT = 100;
-const USER_AGENT = "monarchmoney-node (https://github.com/hakimelek/monarchmoney-node)";
+const USER_AGENT = "MonarchMoneyAPI (https://github.com/hammem/monarchmoney)";
+const ORIGIN = "https://app.monarch.com";
+
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+const DEFAULT_RETRY_BASE_DELAY_MS = 500;
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_RATE_LIMIT_RPS = 0; // disabled
+
+export interface RetryOptions {
+  /** Max retry attempts on 429/5xx errors. Default: `3`. Set to `0` to disable. */
+  maxRetries?: number;
+  /** Base delay between retries in milliseconds. Actual delay uses exponential backoff with jitter. Default: `500`. */
+  baseDelayMs?: number;
+}
+
+export interface RateLimitOptions {
+  /** Maximum requests per second. Default: `0` (unlimited). */
+  requestsPerSecond?: number;
+}
+
+export interface RefreshProgress {
+  /** Number of accounts that have finished syncing. */
+  completed: number;
+  /** Total number of accounts being refreshed. */
+  total: number;
+  /** Elapsed time in milliseconds since the refresh started. */
+  elapsedMs: number;
+}
+
+export type TransactionFilterOptions = {
+  startDate?: string;
+  endDate?: string;
+  search?: string;
+  categoryIds?: string[];
+  accountIds?: string[];
+  tagIds?: string[];
+  hasAttachments?: boolean;
+  hasNotes?: boolean;
+  hiddenFromReports?: boolean;
+  isSplit?: boolean;
+  isRecurring?: boolean;
+  importedFromMint?: boolean;
+  syncedFromInstitution?: boolean;
+};
 
 export interface MonarchMoneyOptions {
   /** Path to the session file. Default: `.mm/mm_session.json` */
@@ -51,6 +101,10 @@ export interface MonarchMoneyOptions {
   timeout?: number;
   /** Pre-existing auth token. Skips login if provided. */
   token?: string;
+  /** Retry configuration for transient failures (429, 5xx). */
+  retry?: RetryOptions;
+  /** Rate limiting configuration. */
+  rateLimit?: RateLimitOptions;
 }
 
 export class MonarchMoney {
@@ -58,6 +112,11 @@ export class MonarchMoney {
   private _sessionFile: string;
   private _token: string | null;
   private _timeout: number;
+  private _maxRetries: number;
+  private _retryBaseDelayMs: number;
+  private _rateLimitRps: number;
+  private _rateLimitTokens: number;
+  private _rateLimitLastRefill: number;
 
   constructor(options: MonarchMoneyOptions = {}) {
     const { sessionFile = SESSION_FILE, timeout = 10, token } = options;
@@ -66,6 +125,10 @@ export class MonarchMoney {
       "Client-Platform": "web",
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
+      Origin: ORIGIN,
+      "device-uuid": crypto.randomUUID(),
+      "monarch-client": "monarch-core-web-app-graphql",
+      "monarch-client-version": "v1.0.1668",
     };
     if (token) {
       this._headers["Authorization"] = `Token ${token}`;
@@ -75,6 +138,13 @@ export class MonarchMoney {
       : path.resolve(process.cwd(), sessionFile);
     this._token = token ?? null;
     this._timeout = timeout * 1000;
+
+    this._maxRetries = options.retry?.maxRetries ?? DEFAULT_MAX_RETRIES;
+    this._retryBaseDelayMs = options.retry?.baseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
+
+    this._rateLimitRps = options.rateLimit?.requestsPerSecond ?? DEFAULT_RATE_LIMIT_RPS;
+    this._rateLimitTokens = this._rateLimitRps || 1;
+    this._rateLimitLastRefill = Date.now();
   }
 
   /** Timeout for API calls, in seconds. */
@@ -150,6 +220,13 @@ export class MonarchMoney {
   }
 
   /**
+   * Submits the code sent to your email when the API returns "Retrieve the code from your email to continue login."
+   */
+  async submitEmailOtp(email: string, password: string, code: string): Promise<void> {
+    await this._submitEmailOtp(email, password, code);
+  }
+
+  /**
    * Interactive CLI login that prompts for email, password, and MFA code if needed.
    */
   async interactiveLogin(
@@ -172,7 +249,11 @@ export class MonarchMoney {
       await this.login(email, passwd, { useSavedSession, saveSession: false });
       if (saveSession) this.saveSession(this._sessionFile);
     } catch (e) {
-      if (e instanceof RequireMFAException) {
+      if (e instanceof EmailOtpRequiredException) {
+        const code = await ask("Enter the code from your email: ");
+        await this.submitEmailOtp(email, passwd, code);
+        if (saveSession) this.saveSession(this._sessionFile);
+      } else if (e instanceof RequireMFAException) {
         const code = await ask("Two Factor Code: ");
         await this.multiFactorAuthenticate(email, passwd, code);
         if (saveSession) this.saveSession(this._sessionFile);
@@ -223,6 +304,8 @@ export class MonarchMoney {
       username: email,
       password,
       supports_mfa: true,
+      supports_email_otp: true,
+      supports_recaptcha: true,
       trusted_device: false,
     };
     if (mfaSecretKey) {
@@ -234,28 +317,36 @@ export class MonarchMoney {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(this._timeout),
     });
-    if (res.status === 403) {
-      throw new RequireMFAException();
+    let bodyText = "";
+    try {
+      bodyText = await res.text();
+    } catch {
+      // ignore
     }
     if (!res.ok) {
       let detail = "";
+      let errorCode = "";
       try {
-        const data = (await res.json()) as Record<string, unknown>;
-        detail =
-          typeof data.detail === "string"
-            ? data.detail
-            : typeof data.error_code === "string"
-              ? data.error_code
-              : "";
+        const data = JSON.parse(bodyText) as Record<string, unknown>;
+        detail = typeof data.detail === "string" ? data.detail : "";
+        errorCode = typeof data.error_code === "string" ? data.error_code : "";
       } catch {
-        // response body not JSON
+        detail = bodyText || "";
+      }
+      const combined = `${detail} ${errorCode}`.toLowerCase();
+
+      if (errorCode === "EMAIL_OTP_REQUIRED" || (res.status === 403 && /email.*code|email.*otp|otp.*email/i.test(combined))) {
+        throw new EmailOtpRequiredException(detail || "Email verification code required. Check your email.");
+      }
+      if (res.status === 403 && /mfa|multi.?factor|two.?factor|2fa|totp/i.test(combined)) {
+        throw new RequireMFAException(detail || "Multi-Factor Auth Required");
       }
       throw new LoginFailedException(
         detail || `HTTP ${res.status}: ${res.statusText}`,
         res.status
       );
     }
-    const data = (await res.json()) as { token: string };
+    const data = JSON.parse(bodyText) as { token: string };
     this.setToken(data.token);
   }
 
@@ -295,6 +386,118 @@ export class MonarchMoney {
     this.setToken(data.token);
   }
 
+  private async _submitEmailOtp(
+    email: string,
+    password: string,
+    code: string
+  ): Promise<void> {
+    const body = {
+      username: email,
+      password,
+      supports_mfa: true,
+      supports_email_otp: true,
+      supports_recaptcha: true,
+      trusted_device: false,
+      email_otp: code,
+    };
+    const res = await fetch(getLoginEndpoint(), {
+      method: "POST",
+      headers: this._headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this._timeout),
+    });
+    let bodyText = "";
+    try {
+      bodyText = await res.text();
+    } catch {
+      // ignore
+    }
+    if (!res.ok) {
+      let msg = "";
+      try {
+        const data = JSON.parse(bodyText) as Record<string, unknown>;
+        if (typeof data.detail === "string") msg = data.detail;
+        else if (typeof data.error_code === "string") msg = data.error_code;
+      } catch {
+        msg = bodyText || "";
+      }
+      throw new LoginFailedException(
+        msg || `HTTP ${res.status}: ${res.statusText}`,
+        res.status
+      );
+    }
+    const data = JSON.parse(bodyText) as { token: string };
+    this.setToken(data.token);
+  }
+
+  // ---------- Rate limiter ----------
+
+  private async _acquireRateLimitToken(): Promise<void> {
+    if (this._rateLimitRps <= 0) return;
+
+    const now = Date.now();
+    const elapsed = now - this._rateLimitLastRefill;
+    const refill = (elapsed / 1000) * this._rateLimitRps;
+    this._rateLimitTokens = Math.min(
+      this._rateLimitRps,
+      this._rateLimitTokens + refill
+    );
+    this._rateLimitLastRefill = now;
+
+    if (this._rateLimitTokens < 1) {
+      const waitMs = ((1 - this._rateLimitTokens) / this._rateLimitRps) * 1000;
+      await new Promise((r) => globalThis.setTimeout(r, waitMs));
+      this._rateLimitTokens = 0;
+      this._rateLimitLastRefill = Date.now();
+    } else {
+      this._rateLimitTokens -= 1;
+    }
+  }
+
+  // ---------- Retry with backoff ----------
+
+  private async _fetchWithRetry(
+    url: string,
+    init: RequestInit
+  ): Promise<Response> {
+    await this._acquireRateLimitToken();
+
+    let lastError: Error | undefined;
+    for (let attempt = 0; attempt <= this._maxRetries; attempt++) {
+      try {
+        const res = await fetch(url, {
+          ...init,
+          signal: AbortSignal.timeout(this._timeout),
+        });
+
+        if (res.ok || !RETRYABLE_STATUS_CODES.has(res.status) || attempt === this._maxRetries) {
+          return res;
+        }
+
+        const retryAfterHeader = res.headers.get("Retry-After");
+        const retryAfterMs = retryAfterHeader
+          ? parseFloat(retryAfterHeader) * 1000
+          : undefined;
+
+        await this._backoff(attempt, retryAfterMs);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt === this._maxRetries) break;
+        await this._backoff(attempt);
+      }
+    }
+    throw lastError ?? new RequestFailedException("Request failed after retries");
+  }
+
+  private async _backoff(attempt: number, retryAfterMs?: number): Promise<void> {
+    const jitter = Math.random() * 0.5 + 0.75; // 0.75–1.25x
+    const exponentialMs = this._retryBaseDelayMs * Math.pow(2, attempt) * jitter;
+    const delayMs = retryAfterMs != null
+      ? Math.max(retryAfterMs, exponentialMs)
+      : exponentialMs;
+    await new Promise((r) => globalThis.setTimeout(r, delayMs));
+  }
+
   // ---------- Private GraphQL ----------
 
   private async gqlCall<T>(
@@ -307,11 +510,10 @@ export class MonarchMoney {
         "Not authenticated. Call login() first or provide a token."
       );
     }
-    const res = await fetch(getGraphQL(), {
+    const res = await this._fetchWithRetry(getGraphQL(), {
       method: "POST",
       headers: this._headers,
       body: JSON.stringify({ operationName: operation, query, variables }),
-      signal: AbortSignal.timeout(this._timeout),
     });
     if (!res.ok) {
       throw new RequestFailedException(
@@ -517,27 +719,80 @@ export class MonarchMoney {
    * Defaults to the most recent 100 transactions.
    */
   async getTransactions(
-    options: {
+    options: TransactionFilterOptions & {
       limit?: number;
       offset?: number;
-      startDate?: string;
-      endDate?: string;
-      search?: string;
-      categoryIds?: string[];
-      accountIds?: string[];
-      tagIds?: string[];
-      hasAttachments?: boolean;
-      hasNotes?: boolean;
-      hiddenFromReports?: boolean;
-      isSplit?: boolean;
-      isRecurring?: boolean;
-      importedFromMint?: boolean;
-      syncedFromInstitution?: boolean;
     } = {}
   ): Promise<GetTransactionsResponse> {
     const {
       limit = DEFAULT_RECORD_LIMIT,
       offset = 0,
+      ...filterOpts
+    } = options;
+
+    const filters = this._buildTransactionFilters(filterOpts);
+
+    return this.gqlCall<GetTransactionsResponse>(
+      "GetTransactionsList",
+      queries.GET_TRANSACTIONS_LIST,
+      { offset, limit, orderBy: "date", filters }
+    );
+  }
+
+  /**
+   * Async generator that automatically paginates through all matching transactions.
+   * Yields one page of `Transaction[]` at a time.
+   *
+   * @param options - Same filter options as `getTransactions()`.
+   * @param options.pageSize - Number of transactions per page. Default: `100`.
+   *
+   * @example
+   * ```ts
+   * for await (const page of mm.getTransactionPages({ startDate: "2025-01-01", endDate: "2025-12-31" })) {
+   *   for (const tx of page) {
+   *     console.log(tx.merchant?.name, tx.amount);
+   *   }
+   * }
+   * ```
+   */
+  async *getTransactionPages(
+    options: TransactionFilterOptions & { pageSize?: number } = {}
+  ): AsyncGenerator<Transaction[], void, undefined> {
+    const { pageSize = DEFAULT_RECORD_LIMIT, ...filterOpts } = options;
+    let offset = 0;
+
+    while (true) {
+      const response = await this.getTransactions({
+        ...filterOpts,
+        limit: pageSize,
+        offset,
+      });
+      const results = response.allTransactions.results;
+      if (results.length === 0) break;
+      yield results;
+      offset += results.length;
+      if (offset >= response.allTransactions.totalCount) break;
+    }
+  }
+
+  /**
+   * Returns all matching transactions across all pages as a flat array.
+   * Convenience wrapper around `getTransactionPages()`.
+   */
+  async getAllTransactions(
+    options: TransactionFilterOptions & { pageSize?: number } = {}
+  ): Promise<Transaction[]> {
+    const all: Transaction[] = [];
+    for await (const page of this.getTransactionPages(options)) {
+      all.push(...page);
+    }
+    return all;
+  }
+
+  private _buildTransactionFilters(
+    opts: TransactionFilterOptions
+  ): Record<string, unknown> {
+    const {
       startDate,
       endDate,
       search = "",
@@ -551,7 +806,7 @@ export class MonarchMoney {
       isRecurring,
       importedFromMint,
       syncedFromInstitution,
-    } = options;
+    } = opts;
 
     if (Boolean(startDate) !== Boolean(endDate)) {
       throw new Error(
@@ -577,12 +832,7 @@ export class MonarchMoney {
       filters.startDate = startDate;
       filters.endDate = endDate;
     }
-
-    return this.gqlCall<GetTransactionsResponse>(
-      "GetTransactionsList",
-      queries.GET_TRANSACTIONS_LIST,
-      { offset, limit, orderBy: "date", filters }
-    );
+    return filters;
   }
 
   /** Gets all transaction categories. */
@@ -819,7 +1069,18 @@ export class MonarchMoney {
 
   /**
    * Refreshes accounts and polls until complete or timeout.
+   *
+   * @param options.onProgress - Called after each poll with progress info.
    * @returns `true` if all accounts refreshed within the timeout, `false` otherwise.
+   *
+   * @example
+   * ```ts
+   * await mm.requestAccountsRefreshAndWait({
+   *   onProgress: ({ completed, total, elapsedMs }) => {
+   *     console.log(`${completed}/${total} accounts refreshed (${(elapsedMs / 1000).toFixed(0)}s)`);
+   *   },
+   * });
+   * ```
    */
   async requestAccountsRefreshAndWait(options?: {
     accountIds?: string[];
@@ -827,18 +1088,40 @@ export class MonarchMoney {
     timeout?: number;
     /** Polling interval in seconds. Default: `10` */
     delay?: number;
+    /** Called after each poll with refresh progress. */
+    onProgress?: (progress: RefreshProgress) => void;
   }): Promise<boolean> {
-    const { timeout = 300, delay = 10 } = options ?? {};
+    const { timeout = 300, delay = 10, onProgress } = options ?? {};
     let accountIds = options?.accountIds;
     if (!accountIds) {
       const data = await this.getAccounts();
       accountIds = data.accounts.map((a) => a.id);
     }
     await this.requestAccountsRefresh(accountIds);
-    const deadline = Date.now() + timeout * 1000;
+    const startTime = Date.now();
+    const deadline = startTime + timeout * 1000;
     while (Date.now() < deadline) {
       await new Promise((r) => globalThis.setTimeout(r, delay * 1000));
-      if (await this.isAccountsRefreshComplete(accountIds)) return true;
+
+      const result = await this.gqlCall<{ accounts: RefreshStatusAccount[] }>(
+        "ForceRefreshAccountsQuery",
+        queries.GET_REFRESH_STATUS
+      );
+      if (!result.accounts) {
+        throw new RequestFailedException("Unable to check refresh status");
+      }
+      const tracked = accountIds.length
+        ? result.accounts.filter((a) => accountIds!.includes(a.id))
+        : result.accounts;
+      const completed = tracked.filter((a) => !a.hasSyncInProgress).length;
+
+      onProgress?.({
+        completed,
+        total: tracked.length,
+        elapsedMs: Date.now() - startTime,
+      });
+
+      if (completed === tracked.length) return true;
     }
     return false;
   }
@@ -1084,11 +1367,10 @@ export class MonarchMoney {
     );
     const headers: Record<string, string> = { ...this._headers };
     delete headers["Content-Type"];
-    const res = await fetch(getAccountBalanceHistoryUploadEndpoint(), {
+    const res = await this._fetchWithRetry(getAccountBalanceHistoryUploadEndpoint(), {
       method: "POST",
       headers,
       body: form,
-      signal: AbortSignal.timeout(this._timeout),
     });
     if (!res.ok) {
       throw new RequestFailedException(

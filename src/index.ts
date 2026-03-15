@@ -1,8 +1,15 @@
 export { MonarchMoney } from "./client.js";
-export type { MonarchMoneyOptions } from "./client.js";
+export type {
+  MonarchMoneyOptions,
+  RetryOptions,
+  RateLimitOptions,
+  RefreshProgress,
+  TransactionFilterOptions,
+} from "./client.js";
 export {
   MonarchMoneyError,
   RequireMFAException,
+  EmailOtpRequiredException,
   LoginFailedException,
   RequestFailedException,
 } from "./errors.js";
